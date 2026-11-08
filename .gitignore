@@ -1,0 +1,16 @@
+# Binaries
+/bin/
+/dist/
+*.exe
+*.test
+*.out
+
+# Local env / secrets
+.env
+*.pem
+!testdata/**/*.pem
+
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store

@@ -1,0 +1,66 @@
+# Example Kubernetes deployment (EKS with IRSA for S3 access).
+# Replace the image, bucket, role ARN and CDN settings; put secrets in the Secret.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: fileservice
+  annotations:
+    eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/fileservice   # grants deploy/aws/iam-policy.json
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: fileservice
+type: Opaque
+stringData:
+  FILESERVICE_API_KEYS: "orders:replace-with-a-long-random-key,media:replace-with-another-key"
+  FILESERVICE_WEBHOOK_SECRET: "replace-me"
+  # CloudFront private key (PEM) for signed URLs
+  FILESERVICE_CDN_PRIVATE_KEY: ""
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fileservice
+spec:
+  replicas: 2   # stateless: scale horizontally
+  selector:
+    matchLabels: { app: fileservice }
+  template:
+    metadata:
+      labels: { app: fileservice }
+    spec:
+      serviceAccountName: fileservice
+      containers:
+        - name: fileservice
+          image: ghcr.io/go-abhi/fileservice:latest
+          ports:
+            - { name: http, containerPort: 8080 }
+            - { name: grpc, containerPort: 9090 }
+          env:
+            - { name: FILESERVICE_S3_BUCKET, value: my-files-bucket }
+            - { name: AWS_REGION, value: us-east-1 }
+            - { name: FILESERVICE_CDN_DOMAIN, value: cdn.example.com }
+            - { name: FILESERVICE_CDN_KEY_PAIR_ID, value: K2JCJMDEHXQW5F }
+            - { name: FILESERVICE_WEBHOOK_URL, value: http://events-receiver.default.svc/fileservice }
+          envFrom:
+            - secretRef: { name: fileservice }
+          readinessProbe:
+            grpc: { port: 9090 }
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 20
+          resources:
+            requests: { cpu: 100m, memory: 128Mi }
+            limits: { memory: 1Gi }   # streamed uploads buffer up to 64 MiB each
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: fileservice
+spec:
+  selector: { app: fileservice }
+  ports:
+    - { name: http, port: 8080, targetPort: http }
+    - { name: grpc, port: 9090, targetPort: grpc, appProtocol: kubernetes.io/h2c }

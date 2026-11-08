@@ -1,0 +1,8 @@
+.git
+.github
+bin
+dist
+_scratch
+*.test
+*.out
+.env

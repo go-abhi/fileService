@@ -1,0 +1,271 @@
+syntax = "proto3";
+
+package fileservice.v1;
+
+import "google/protobuf/duration.proto";
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/go-abhi/fileService/api/fileservice/v1;fileservicev1";
+
+// FileService stores and serves files backed by S3-compatible object storage.
+//
+// Uploads:
+//   * Direct (recommended, any size up to 5 TiB): CreateUpload returns
+//     presigned URLs; the client PUTs each part straight to storage (in
+//     parallel, resumable) and calls CompleteUpload. File bytes never pass
+//     through the service.
+//   * Streamed: UploadStream sends bytes through the service. Simple for
+//     internal callers that cannot reach storage directly.
+//
+// Downloads:
+//   * GetDownloadURL returns a short-lived CDN (CloudFront) signed URL, or a
+//     presigned S3 URL when no CDN is configured. Both support HTTP Range
+//     requests for parallel / resumable downloads.
+//   * DownloadStream streams (a range of) the content through the service.
+//
+// Every call is scoped to the caller's namespace, derived from its API key
+// (metadata "authorization: Bearer <key>" or "x-api-key: <key>").
+service FileService {
+  // CreateUpload starts a direct-to-storage multipart upload and returns
+  // presigned URLs for the first parts.
+  rpc CreateUpload(CreateUploadRequest) returns (CreateUploadResponse);
+  // GetUploadPartURLs returns fresh presigned URLs for the given parts.
+  rpc GetUploadPartURLs(GetUploadPartURLsRequest) returns (GetUploadPartURLsResponse);
+  // GetUpload returns the state of an upload, including the parts already
+  // stored. Use it to resume an interrupted upload.
+  rpc GetUpload(GetUploadRequest) returns (GetUploadResponse);
+  // CompleteUpload verifies the uploaded parts and assembles the file.
+  // It is idempotent.
+  rpc CompleteUpload(CompleteUploadRequest) returns (CompleteUploadResponse);
+  // AbortUpload cancels an upload and discards its parts.
+  rpc AbortUpload(AbortUploadRequest) returns (AbortUploadResponse);
+
+  // UploadStream uploads a file through the service. The first message must
+  // carry the header; every following message carries a chunk of content.
+  rpc UploadStream(stream UploadStreamRequest) returns (UploadStreamResponse);
+  // DownloadStream streams file content through the service. The first
+  // message carries the file metadata; the following ones carry chunks.
+  rpc DownloadStream(DownloadStreamRequest) returns (stream DownloadStreamResponse);
+
+  // GetDownloadURL returns a short-lived URL to download the file from the
+  // CDN or object storage.
+  rpc GetDownloadURL(GetDownloadURLRequest) returns (GetDownloadURLResponse);
+
+  // GetFile returns file metadata.
+  rpc GetFile(GetFileRequest) returns (GetFileResponse);
+  // ListFiles lists files in the caller's namespace, newest first.
+  rpc ListFiles(ListFilesRequest) returns (ListFilesResponse);
+  // DeleteFile deletes a file, or aborts it if its upload is in progress.
+  rpc DeleteFile(DeleteFileRequest) returns (DeleteFileResponse);
+}
+
+// FileStatus is the lifecycle state of a file.
+enum FileStatus {
+  FILE_STATUS_UNSPECIFIED = 0;
+  // The upload has started but is not complete.
+  FILE_STATUS_PENDING = 1;
+  // The content is stored and can be downloaded.
+  FILE_STATUS_AVAILABLE = 2;
+}
+
+// ContentDisposition controls how browsers treat a download.
+enum ContentDisposition {
+  // Server default (inline).
+  CONTENT_DISPOSITION_UNSPECIFIED = 0;
+  // Display in the browser when possible.
+  CONTENT_DISPOSITION_INLINE = 1;
+  // Prompt to save as a file.
+  CONTENT_DISPOSITION_ATTACHMENT = 2;
+}
+
+// File is a stored file.
+message File {
+  // Unique ID (UUIDv7).
+  string id = 1;
+  // Namespace (tenant) that owns the file.
+  string namespace = 2;
+  // Original file name.
+  string name = 3;
+  // MIME type.
+  string content_type = 4;
+  // Size in bytes.
+  int64 size = 5;
+  // Hex SHA-256 of the content, when computed by the service (streamed uploads).
+  string sha256 = 6;
+  // Storage ETag.
+  string etag = 7;
+  FileStatus status = 8;
+  // Caller-defined metadata.
+  map<string, string> metadata = 9;
+  google.protobuf.Timestamp create_time = 10;
+  google.protobuf.Timestamp update_time = 11;
+}
+
+// UploadPartURL is a presigned request for one part of a direct upload.
+message UploadPartURL {
+  // 1-based part number.
+  int32 part_number = 1;
+  // URL to send the part to.
+  string url = 2;
+  // HTTP method (PUT).
+  string method = 3;
+  // Offset of the part in the file.
+  int64 offset = 4;
+  // Exact number of bytes to send; the URL rejects any other Content-Length.
+  int64 size = 5;
+  // Additional headers to send with the request.
+  map<string, string> headers = 6;
+  // When the URL stops working. Request a new one with GetUploadPartURLs.
+  google.protobuf.Timestamp expire_time = 7;
+}
+
+message CreateUploadRequest {
+  // File name. Required.
+  string name = 1;
+  // MIME type. Detected from the name when empty.
+  string content_type = 2;
+  // Total size in bytes. Required.
+  int64 size = 3;
+  // Preferred part size in bytes (min 5 MiB). The server picks a value when 0
+  // and may raise it so the file fits in 10,000 parts.
+  int64 part_size = 4;
+  // Caller-defined metadata (max 32 entries).
+  map<string, string> metadata = 5;
+}
+
+message CreateUploadResponse {
+  // Upload ID; equal to the ID of the file being created.
+  string upload_id = 1;
+  File file = 2;
+  int64 part_size = 3;
+  int32 part_count = 4;
+  // Presigned URLs for the first parts (up to 100). Fetch the rest with
+  // GetUploadPartURLs.
+  repeated UploadPartURL parts = 5;
+  // Deadline to complete the upload.
+  google.protobuf.Timestamp expire_time = 6;
+}
+
+message GetUploadPartURLsRequest {
+  string upload_id = 1;
+  // 1-based part numbers, at most 1000 per call.
+  repeated int32 part_numbers = 2;
+}
+
+message GetUploadPartURLsResponse {
+  repeated UploadPartURL parts = 1;
+}
+
+message GetUploadRequest {
+  string upload_id = 1;
+}
+
+// UploadedPart is a part already stored.
+message UploadedPart {
+  int32 part_number = 1;
+  int64 size = 2;
+  string etag = 3;
+}
+
+message GetUploadResponse {
+  File file = 1;
+  int64 part_size = 2;
+  int32 part_count = 3;
+  // Parts already stored, in ascending order.
+  repeated UploadedPart uploaded_parts = 4;
+  google.protobuf.Timestamp expire_time = 5;
+}
+
+message CompleteUploadRequest {
+  string upload_id = 1;
+}
+
+message CompleteUploadResponse {
+  File file = 1;
+}
+
+message AbortUploadRequest {
+  string upload_id = 1;
+}
+
+message AbortUploadResponse {}
+
+message UploadStreamHeader {
+  // File name. Required.
+  string name = 1;
+  // MIME type. Detected from the name when empty.
+  string content_type = 2;
+  // Total size in bytes, if known. The upload fails if the stream differs.
+  optional int64 size = 3;
+  map<string, string> metadata = 4;
+}
+
+message UploadStreamRequest {
+  oneof payload {
+    UploadStreamHeader header = 1;
+    bytes chunk = 2;
+  }
+}
+
+message UploadStreamResponse {
+  File file = 1;
+}
+
+message DownloadStreamRequest {
+  string file_id = 1;
+  // Byte offset to start from.
+  int64 offset = 2;
+  // Number of bytes to return; 0 means to the end of the file.
+  int64 length = 3;
+}
+
+message DownloadStreamResponse {
+  oneof payload {
+    File file = 1;
+    bytes chunk = 2;
+  }
+}
+
+message GetDownloadURLRequest {
+  string file_id = 1;
+  // URL lifetime. Server default when unset; capped by the server maximum.
+  google.protobuf.Duration ttl = 2;
+  ContentDisposition disposition = 3;
+}
+
+message GetDownloadURLResponse {
+  string url = 1;
+  google.protobuf.Timestamp expire_time = 2;
+  // True when the URL is served by the CDN.
+  bool cdn = 3;
+  File file = 4;
+}
+
+message GetFileRequest {
+  string file_id = 1;
+}
+
+message GetFileResponse {
+  File file = 1;
+}
+
+message ListFilesRequest {
+  // Max files to return (default 50, max 1000).
+  int32 page_size = 1;
+  // Token from a previous response.
+  string page_token = 2;
+  // Include uploads that are still in progress.
+  bool include_pending = 3;
+}
+
+message ListFilesResponse {
+  repeated File files = 1;
+  // Empty when there are no more files.
+  string next_page_token = 2;
+}
+
+message DeleteFileRequest {
+  string file_id = 1;
+}
+
+message DeleteFileResponse {}
